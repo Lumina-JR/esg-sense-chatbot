@@ -10,7 +10,7 @@ load_dotenv()
 
 app = FastAPI(title="S.E.N.S.E ESG Assistant")
 
-# CORS (important when frontend is on different Render service or same)
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,17 +22,18 @@ app.add_middleware(
 # Load historical ESG data
 esg_df = pd.read_excel("backend/data/historical_esg.xlsx")
 
+# Groq client (Llama models)
 client = OpenAI(
-    api_key=os.getenv("XAI_API_KEY"),
-    base_url="https://api.x.ai/v1"
+    api_key=os.getenv("GROQ_API_KEY"),           # ← Change env var name
+    base_url="https://api.groq.com/openai/v1"    # ← Groq endpoint
 )
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         return "\n".join([page.get_text("text") for page in doc])
-    except:
-        return "Error extracting text from PDF."
+    except Exception as e:
+        return f"Error extracting text: {str(e)}"
 
 @app.post("/chat")
 async def chat(
@@ -45,11 +46,11 @@ async def chat(
     if not files:
         raise HTTPException(400, "Please upload at least one document")
 
-    # Extract from first file (extend later if needed)
+    # Extract text from uploaded document
     content = await files[0].read()
     doc_text = extract_text_from_pdf(content)
 
-    # Get relevant historical examples
+    # Retrieve relevant historical examples from Excel
     relevant = esg_df[
         (esg_df['indicator_name'].str.contains(indicator_name, case=False, na=False) |
          esg_df['tick_box_name'].str.contains(tick_box_name, case=False, na=False))
@@ -74,10 +75,11 @@ Instructions:
 - Always quote **exact text** from the company document.
 - Use page numbers if available.
 - Reply with "Yes - Supported" or "No - Not found" + clear reasoning + citations.
+- Be strict and professional.
 """
 
     response = client.chat.completions.create(
-        model="grok-beta",
+        model="llama-3.3-70b-versatile",   # Fast & strong Llama model on Groq
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1,
         max_tokens=1800
@@ -92,4 +94,4 @@ Instructions:
 
 @app.get("/")
 async def root():
-    return {"status": "S.E.N.S.E Backend is running"}
+    return {"status": "S.E.N.S.E Backend (Groq Llama) is running"}
