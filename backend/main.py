@@ -1,7 +1,7 @@
 import os
 import re
 import time
-import fitz  # PyMuPDF
+import pymupdf  # PyMuPDF — use the "pymupdf" module directly; "fitz" is deprecated
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -84,7 +84,7 @@ TICKBOX_PATTERN = re.compile(
 
 
 def load_methodology(path: str) -> dict:
-    doc = fitz.open(path)
+    doc = pymupdf.open(path)
     full_text = "\n".join(page.get_text("text") for page in doc)
     doc.close()
 
@@ -156,7 +156,7 @@ def _prune_expired_sessions():
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         return "\n".join(page.get_text("text") for page in doc)
     except Exception as e:
         return f"Error extracting text: {str(e)}"
