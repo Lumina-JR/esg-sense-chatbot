@@ -5,6 +5,7 @@ import pymupdf  # PyMuPDF — use the "pymupdf" module directly; "fitz" is depre
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -314,7 +315,14 @@ Instructions:
 - Be strict and professional.
 """
 
-    response = client.chat.completions.create(
+    # client.chat.completions.create is a BLOCKING synchronous call. Running it
+    # directly inside this async route would freeze the whole event loop for
+    # the duration of the Groq call (which can be many seconds with reasoning
+    # mode on) — starving every other request/connection on this worker and
+    # causing Render's proxy to reset long-idle HTTP/2 streams. run_in_threadpool
+    # offloads it to a worker thread so the event loop stays free.
+    response = await run_in_threadpool(
+        client.chat.completions.create,
         model=GROQ_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1,
