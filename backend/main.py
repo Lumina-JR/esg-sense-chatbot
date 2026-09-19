@@ -232,7 +232,7 @@ async def chat(
     indicator_name: str = Form(""),
     tick_box_name: str = Form(""),
     session_id: str = Form(...),
-    files: list[UploadFile] = File(default=[]),
+    files: list[UploadFile] = File(default_factory=list),
 ):
     _prune_expired_sessions()
 
