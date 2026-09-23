@@ -1,11 +1,11 @@
 import os
 import re
 import time
+from typing import Annotated
 import pymupdf  # PyMuPDF — use the "pymupdf" module directly; "fitz" is deprecated
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.concurrency import run_in_threadpool
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -22,27 +22,19 @@ app.add_middleware(
 )
 
 # ── Model config ────────────────────────────────────────────────────────
-# llama-3.3-70b-versatile was deprecated by Groq. Switched to Qwen 3.6 27B
-# (qwen/qwen3.6-27b) — a reasoning model with an explicit thinking mode,
-# which exposes the step-by-step analysis process separately from the
-# final answer via reasoning_format="parsed". Centralized here so future
-# model swaps are one line.
+# Centralized here so future model swaps are one line.
 GROQ_MODEL = "qwen/qwen3.6-27b"
 
-# ── Groq client — server-side only. API key lives in Render's env vars,
-# never sent to or requested from the browser. ──
+# ── Groq client — server-side only. ──
 client = OpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1",
+    base_url="https://groq.com",
 )
 
 if not os.getenv("GROQ_API_KEY"):
-    # Fail loudly at startup rather than on first request — easier to
-    # catch a missing Render env var immediately.
     raise RuntimeError(
         "GROQ_API_KEY is not set. Add it under Render → Environment."
     )
-
 
 # ── Load historical ESG reference data (kept in git, loaded once) ──
 HISTORICAL_XLSX_PATH = "data/historical_esg.xlsx"
@@ -55,20 +47,6 @@ if missing_cols:
 
 
 # ── Load and parse methodology PDF (kept in git, parsed once at startup) ──
-# Expected structure (see methodology.pdf for the full template):
-#
-#   === INDICATOR: S.1.3 ===
-#   INDICATOR NAME: Diversity Programmes
-#
-#   --- TICK-BOX: Initiatives supporting a diverse workforce ---
-#   LOOK FOR:
-#   - ...
-#   DO NOT ACCEPT:
-#   - ...
-#   EDGE CASES:
-#   - ...
-#
-# Parsed once into: methodology[indicator_code]["tickboxes"][tick_box_name] = guidance_text
 METHODOLOGY_PDF_PATH = "data/methodology.pdf"
 
 INDICATOR_PATTERN = re.compile(
@@ -108,9 +86,6 @@ if not methodology_store:
     )
 
 
-# ── Sanity check: flag indicator/tick-box pairs that exist in one source
-# but not the other, so mismatches surface at startup instead of silently
-# producing thin context at query time. ──
 def _validate_sources_aligned():
     excel_pairs = set(
         zip(esg_df["indicator_code"].astype(str), esg_df["tick_box_name"].astype(str))
@@ -137,12 +112,6 @@ _validate_sources_aligned()
 
 
 # ── In-memory session store ──────────────────────────────────────────────
-# session_store[session_id] = {
-#     "documents": { filename: extracted_text, ... },
-#     "last_indicator": str,
-#     "last_tickbox": str,
-#     "updated_at": float,
-# }
 session_store: dict[str, dict] = {}
 SESSION_TTL_SECONDS = 60 * 60 * 4  # 4 hours of inactivity
 
@@ -164,7 +133,6 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 
 
 def get_historical_context(indicator_code: str, tick_box_name: str) -> str:
-    """Filter historical citation examples. Empty string if no match terms given."""
     if not indicator_code and not tick_box_name:
         return ""
 
@@ -185,7 +153,6 @@ def get_historical_context(indicator_code: str, tick_box_name: str) -> str:
 
 
 def get_methodology_guidance(indicator_code: str, tick_box_name: str) -> str:
-    """Look up LOOK FOR / DO NOT ACCEPT / EDGE CASES guidance for this pair."""
     if not indicator_code:
         return ""
 
@@ -200,13 +167,11 @@ def get_methodology_guidance(indicator_code: str, tick_box_name: str) -> str:
                 return f"[{entry['name']} — {tb_name}]\n{guidance}"
         return ""
 
-    # No specific tick-box given — return all guidance for the indicator
     sections = [f"[{entry['name']} — {tb}]\n{g}" for tb, g in entry["tickboxes"].items()]
     return "\n\n".join(sections)
 
 
 def extract_citations(answer_text: str) -> list[dict]:
-    """Pull quoted spans + optional page refs out of the model's answer."""
     citations = []
     pattern = re.compile(
         r'["“]([^"”]{8,500})["”]'
@@ -226,134 +191,105 @@ def extract_citations(answer_text: str) -> list[dict]:
     return citations
 
 
+# ── Updated Chat Endpoint ────────────────────────────────────────────────
 @app.post("/chat")
 async def chat(
     query: str = Form(...),
     indicator_name: str = Form(""),
     tick_box_name: str = Form(""),
     session_id: str = Form(...),
-    files: list[UploadFile] = File(default_factory=list),
+    file: Annotated[UploadFile | None, File()] = None,  # Fixed: Cleanly optional single file payload
 ):
     _prune_expired_sessions()
 
+    # Retrieve or create session context
     session = session_store.setdefault(session_id, {
         "documents": {},
         "last_indicator": "",
         "last_tickbox": "",
         "updated_at": time.time(),
     })
-
-    # ── New uploads are ADDED to the session's doc set, not replaced ──
-    for f in files:
-        content = await f.read()
-        if f.filename.lower().endswith(".pdf"):
-            text = extract_text_from_pdf(content)
-        else:
-            try:
-                text = content.decode("utf-8", errors="ignore")
-            except Exception:
-                text = ""
-        session["documents"][f.filename] = text
-
-    if not session["documents"]:
-        raise HTTPException(
-            400,
-            "No document available for this session. Please upload at least one document.",
-        )
-
-    # ── Indicator/tick-box: explicit values win, else fall back to the
-    # session's last-used values (follow-up support). ──
-    indicator = indicator_name.strip() or session["last_indicator"]
-    tickbox = tick_box_name.strip() or session["last_tickbox"]
-
-    session["last_indicator"] = indicator
-    session["last_tickbox"] = tickbox
     session["updated_at"] = time.time()
 
-    historical_context = get_historical_context(indicator, tickbox)
-    methodology_guidance = get_methodology_guidance(indicator, tickbox)
+    # ── 1. Process Uploaded PDF File ──
+    if file and file.filename:
+        if not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid file layout. Only PDF files (.pdf) are permitted.",
+            )
+        
+        try:
+            content = await file.read()
+            extracted_text = extract_text_from_pdf(content)
+            session["documents"][file.filename] = extracted_text
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to process file upload: {str(e)}",
+            )
 
-    context_block = historical_context or "No historical examples available."
-    methodology_block = methodology_guidance or "No specific methodology guidance found for this indicator/tick-box."
-
-    combined_docs = "\n\n".join(
-        f"=== Document: {name} ===\n{text[:14000]}"
-        for name, text in session["documents"].items()
+    # ── 2. Build Context boundaries ──
+    # Combine text from all documents associated with this active session
+    uploaded_docs_context = "\n\n".join(
+        f"--- DOCUMENT: {fname} ---\n{text}"
+        for fname, text in session["documents"].items()
     )
 
-    prompt = f"""You are S.E.N.S.E — a precise, analyst-grade ESG research assistant.
+    # Resolve indicator mappings
+    indicator_code = ""
+    if indicator_name:
+        # Match "S.1.3" from strings like "S.1.3 - Diversity Programmes"
+        match = re.match(r"^([A-Z]\.\d+(?:\.\d+)?)\b", indicator_name.strip())
+        indicator_code = match.group(1) if match else indicator_name.strip()
 
-Indicator: {indicator or 'Not specified'}
-Tick-box: {tickbox or 'Not specified'}
+    methodology_context = get_methodology_guidance(indicator_code, tick_box_name)
+    historical_context = get_historical_context(indicator_code, tick_box_name)
 
-METHODOLOGY GUIDANCE (follow these rules strictly — what to look for, what
-to reject, and how to handle edge cases):
-{methodology_block}
+    # ── 3. Execute LLM Call ──
+    system_prompt = (
+        "You are the S.E.N.S.E ESG Assistant, an expert tool assessing compliance. "
+        "Analyze the provided uploaded documents alongside the methodology text rules "
+        "and historical baseline logs. Answer the user query comprehensively. "
+        "When referencing statements from the uploaded document, wrap exact text quotes "
+        "in double quotes like \"exact quote snippet here\" and include page numbers if visible."
+    )
 
-HISTORICAL CITATION EXAMPLES (past approved/rejected examples for calibration):
-{context_block}
+    user_payload = f"""User Query: {query}
 
-COMPANY DOCUMENT(S):
-{combined_docs}
+=== METHODOLOGY RULEBOOK MATCH ===
+{methodology_context or 'No direct matching methodology criteria loaded for this selection.'}
 
-User Request: {query}
+=== HISTORICAL CITATION BASELINES ===
+{historical_context or 'No historical precedent entries found.'}
 
-Instructions:
-- Work through this step by step: first identify what the methodology
-  requires for this tick-box, then scan the document for matching evidence,
-  then compare what you found against the "DO NOT ACCEPT" list before
-  reaching a verdict.
-- Apply the methodology guidance above before judging the document. If the
-  document only partially satisfies a "LOOK FOR" criterion, say so explicitly
-  rather than rounding up to a full match.
-- If the company document contains language matching anything under
-  "DO NOT ACCEPT" in the methodology, do not treat it as sufficient evidence.
-- Always quote **exact text** from the company document, wrapped in
-  quotation marks, with page numbers where available, e.g. "exact text" (p. 12).
-- Reply with "Yes - Supported", "Partially Supported", or "No - Not found",
-  followed by clear reasoning and citations.
-- Be strict and professional.
+=== ACTIVE UPLOADED DOCUMENTS ===
+{uploaded_docs_context or 'No documents have been uploaded in this session yet.'}
 """
 
-    # client.chat.completions.create is a BLOCKING synchronous call. Running it
-    # directly inside this async route would freeze the whole event loop for
-    # the duration of the Groq call (which can be many seconds with reasoning
-    # mode on) — starving every other request/connection on this worker and
-    # causing Render's proxy to reset long-idle HTTP/2 streams. run_in_threadpool
-    # offloads it to a worker thread so the event loop stays free.
-    response = await run_in_threadpool(
-        client.chat.completions.create,
-        model=GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-        max_tokens=1800,
-        reasoning_effort="default",   # "default" = thinking mode on, "none" = off
-        reasoning_format="parsed",    # returns thinking in its own field, separate from the answer
-    )
+    try:
+        # Requesting structure compatible with Reasoning models that have an explicit thinking phase
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_payload}
+            ],
+            extra_body={"reasoning_format": "parsed"}  # Exposes Qwen step-by-step thinking track
+        )
+        
+        answer = response.choices[0].message.content
+        citations = extract_citations(answer)
 
-    message = response.choices[0].message
-    answer = message.content
-    reasoning = getattr(message, "reasoning", None) or ""
-    citations = extract_citations(answer)
+        return {
+            "answer": answer,
+            "citations": citations,
+            "session_id": session_id,
+            "tracked_files": list(session["documents"].keys())
+        }
 
-    return {
-        "answer": answer,
-        "reasoning": reasoning,
-        "citations": citations,
-    }
-
-
-@app.delete("/session")
-async def clear_session(session_id: str = Form(...)):
-    session_store.pop(session_id, None)
-    return {"status": "cleared", "session_id": session_id}
-
-
-@app.get("/")
-async def root():
-    return {
-        "status": "S.E.N.S.E Backend is running",
-        "model": GROQ_MODEL,
-        "indicators_loaded": len(methodology_store),
-        "historical_rows_loaded": len(esg_df),
-    }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Upstream inference engine failure: {str(e)}"
+        )
